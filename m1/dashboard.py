@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -139,33 +140,52 @@ def choose(kind, label, options, key, default, **kw):
     return value
 
 
-def stock_chips():
-    return choose(
+def period_window(dates, anchor, days=3, start=None, end=None):
+    available = sorted({date for date in dates if date <= anchor})
+    if days == "自訂":
+        return [date for date in available if start <= date <= end]
+    return available[-days:]
+
+
+def period_selector(d, prefix):
+    dates = sorted({p[1] for p in d["versions"] if p[1] <= d["date"]})
+    days = choose(
         st.pills,
-        "個股期間",
-        [3, 10],
-        "stock_period",
+        "排行期間" if prefix == "rank" else "個股期間",
+        [3, 5, 10, 20, "自訂"],
+        prefix + "_period",
         3,
-        format_func=lambda n: f"近{n}日",
+        format_func=lambda n: "自訂" if n == "自訂" else f"近{n}日",
     )
+    start = end = None
+    if days == "自訂":
+        defaults = dates[-3:]
+        # Anchor changes can remove a previously selected date from the options.
+        for suffix in ("start", "end"):
+            key = f"{prefix}_{suffix}"
+            if st.session_state.get(key) not in dates:
+                st.session_state.pop(key, None)
+        start = st.selectbox(
+            "開始交易日", dates, index=dates.index(defaults[0]), key=prefix + "_start"
+        )
+        end = st.selectbox(
+            "結束交易日", dates, index=len(dates) - 1, key=prefix + "_end"
+        )
+        if start > end:
+            st.warning("開始交易日不可晚於結束交易日")
+    window = period_window(dates, d["date"], days, start, end)
+    st.caption(
+        f"區間：{window[0] if window else start} ~ {window[-1] if window else end}（{len(window)} 個交易日）"
+    )
+    return window, "自訂" if days == "自訂" else f"近{days}日"
 
 
 def ranking_chips():
     side = choose(
         st.segmented_control, "方向", ["買超", "賣超"], "rank_direction", "買超"
     )
-    days = choose(
-        st.pills,
-        "排行期間",
-        [3, 10],
-        "rank_period",
-        3,
-        format_func=lambda n: f"近{n}日",
-    )
     minimum = 0
     with st.expander("進階篩選：自訂排行，不影響日報摘要"):
-        advanced = st.checkbox("使用進階期間與門檻", key="rank_advanced")
-        extra_days = st.selectbox("自訂期間", [3, 5, 10, 20], key="rank_extra_period")
         threshold = choose(
             st.pills, "金額門檻（千元）", [0, 1000, 5000, 10000], "rank_minimum", 0
         )
@@ -173,9 +193,56 @@ def ranking_chips():
         value = st.number_input(
             "自訂金額（千元）", min_value=0, value=0, key="rank_amount"
         )
-        if advanced:
-            days, minimum = extra_days, value if custom else threshold
-    return side, days, minimum
+        minimum = value if custom else threshold
+    return side, minimum
+
+
+def amount_chart_data(history, code, window):
+    amounts = {
+        r["trade_date"]: number(r.get("net_amount_ntd"))
+        for r in history
+        if r["code"] == code and r["trade_date"] in window
+    }
+    frame = pd.DataFrame(
+        [
+            {
+                "日期": date,
+                "每日淨金額": float(amounts[date] / 1000)
+                if amounts.get(date) is not None
+                else None,
+            }
+            for date in sorted(window)
+        ],
+        columns=["日期", "每日淨金額"],
+    )
+    frame["累積淨金額"] = frame["每日淨金額"].cumsum()
+    return frame
+
+
+def render_amount_chart(history, code, window):
+    if not any(r["code"] == code and r["trade_date"] in window for r in history):
+        st.info("此區間無資料")
+        return
+    frame = amount_chart_data(history, code, window)
+    base = alt.Chart(frame).encode(
+        x=alt.X("日期:O", title="交易日", axis=alt.Axis(labelAngle=-45))
+    )
+    bars = base.mark_bar().encode(
+        y=alt.Y("每日淨金額:Q", title="淨金額（千元）"),
+        color=alt.condition(
+            alt.datum["每日淨金額"] >= 0, alt.value("#E67F75"), alt.value("#6CB097")
+        ),
+        tooltip=["日期:O", "每日淨金額:Q", "累積淨金額:Q"],
+    )
+    line = base.mark_line(point=True, color="#537CAD").encode(y="累積淨金額:Q")
+    st.altair_chart(
+        (bars + line).properties(height=300),
+        width="stretch",
+        alt=f"{code} 每日淨金額長條與累積淨金額折線，單位千元",
+    )
+    st.caption(
+        "金額為實際淨金額；實際張數僅自 2026-11-11 起提供，且限 Top-50 張數榜代號。缺少個股資料的交易日留空，不補零。"
+    )
 
 
 def stock_url(code, date):
@@ -362,12 +429,9 @@ def rank_data(db, versions, history, window, direction, minimum, page):
 
 
 @st.fragment
-def ranking_cards(d):
-    side, days, minimum = ranking_chips()
-    window = sorted(
-        {r["trade_date"] for r in d["history"] if r["trade_date"] <= d["date"]}
-    )[-days:]
-    signature = (d["versions"], d["date"], side, days, minimum)
+def ranking_cards(d, window):
+    side, minimum = ranking_chips()
+    signature = (d["versions"], d["date"], side, tuple(window), minimum)
     if st.session_state.get("rank_signature") != signature:
         st.session_state.update(rank_signature=signature, rank_page=0)
     page = st.session_state["rank_page"]
@@ -402,11 +466,19 @@ def ranking_page():
     st.subheader("排行")
     d = context()
     st.caption(f"交易日 {d['date']}")
-    ranking_summary(d)
+    window, label = period_selector(d, "rank")
+    st.caption("Top50可取得範圍；金額與累積張數為區間合計")
+    for direction, title in (("buy", "買超"), ("sell", "賣超")):
+        st.subheader(f"{label}{title}前3")
+        rows = flat_rank_rows(d["history"], window, direction)[:3]
+        for row in rows:
+            render_stock_card(d, row)
+        if not rows:
+            st.info("此區間無資料")
     full = st.expander("完整排行", key="full_ranking", on_change="rerun")
     if full.open:
         with full:
-            ranking_cards(d)
+            ranking_cards(d, window)
     source_notes()
 
 
@@ -470,8 +542,7 @@ def stock_page():
             },
             link=False,
         )
-        days = stock_chips()
-        window = sorted({r["trade_date"] for r in d["history"]})[-days:]
+        window, label = period_selector(d, "stock")
         with measure(st.session_state, "compute"):
             rows = [
                 r
@@ -484,7 +555,7 @@ def stock_page():
                 if number(r.get("net_amount_ntd")) is not None
             ]
             summary = _lots_summary(d["history"], code, window)
-        st.write(f"近{days}日區間合計")
+        st.write(f"{label}區間合計")
         render_stock_card(
             d,
             dict(
@@ -505,24 +576,7 @@ def stock_page():
             )
             if edit(d["db"], code, d["names"].get(code, ""), category):
                 st.rerun()
-        if rows:
-            frame = pd.DataFrame(
-                [
-                    {
-                        "日期": r["trade_date"],
-                        "每日實際淨張數": float(r["net_lots"])
-                        if r["net_lots"] is not None
-                        else None,
-                    }
-                    for r in rows
-                ]
-            ).set_index("日期")
-            st.line_chart(
-                frame,
-                height=300,
-                width="stretch",
-                alt=f"{code} 每日實際淨張數走勢；缺值不補零",
-            )
+        render_amount_chart(d["history"], code, window)
         st.subheader("訊號原因")
         for event in d["events"]:
             if event["code"] == code and event["rule_id"] in {"R1", "R2", "R3"}:
