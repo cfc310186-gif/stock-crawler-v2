@@ -194,7 +194,10 @@ def ranking_chips():
             "自訂金額（千元）", min_value=0, value=0, key="rank_amount"
         )
         minimum = value if custom else threshold
-    return side, minimum
+        appear_days = st.slider(
+            "至少出現天數 (該方向)", 1, 20, 1, key="rank_appear_days"
+        )
+    return side, minimum, appear_days
 
 
 def amount_chart_data(history, code, window):
@@ -277,7 +280,7 @@ def card_lines(code, name, row, *, estimated=False):
     )
 
 
-def render_stock_card(d, row, *, event=None, link=True):
+def render_stock_card(d, row, *, event=None, link=True, ranking=False):
     code = row["code"]
     lines = card_lines(
         code,
@@ -286,7 +289,10 @@ def render_stock_card(d, row, *, event=None, link=True):
         estimated=bool(event and event.get("basis") == "estimated"),
     )
     with st.container(border=True):
-        st.markdown(f"**{lines[0]}**")
+        star = "⭐ " if ranking and code in {w["code"] for w in d["watch"]} else ""
+        st.markdown(f"**{star}{lines[0]}**")
+        if ranking and "appear_days" in row:
+            st.caption(f"出現 {row['appear_days']} 天")
         if lines[1]:
             st.write(lines[1])
         with st.container(horizontal=True, vertical_alignment="center"):
@@ -354,7 +360,7 @@ def ranking_summary(d):
                 f"可用 {len(window)} 個交易日：{window[0] if window else '無'} 至 {window[-1] if window else '無'}"
             )
         for row in rows:
-            render_stock_card(d, row)
+            render_stock_card(d, row, ranking=True)
         if not rows:
             st.write("無符合資料")
 
@@ -419,19 +425,27 @@ def today_page():
 
 
 @st.cache_data
-def rank_data(db, versions, history, window, direction, minimum, page):
+def rank_data(db, versions, history, window, direction, minimum, page, appear_days=1):
+    dates_by_code = {}
+    for row in history:
+        if row["trade_date"] not in window:
+            continue
+        amount = number(row.get("net_amount_ntd"))
+        if amount is not None and (amount > 0 if direction == "buy" else amount < 0):
+            dates_by_code.setdefault(row["code"], set()).add(row["trade_date"])
     rows = [
-        r
+        dict(r, appear_days=len(dates_by_code.get(r["code"], set())))
         for r in flat_rank_rows(history, window, direction)
         if abs(r["net_amount_k"]) >= minimum
+        and len(dates_by_code.get(r["code"], set())) >= appear_days
     ]
     return rows[page * 20 : (page + 1) * 20], len(rows)
 
 
 @st.fragment
 def ranking_cards(d, window):
-    side, minimum = ranking_chips()
-    signature = (d["versions"], d["date"], side, tuple(window), minimum)
+    side, minimum, appear_days = ranking_chips()
+    signature = (d["versions"], d["date"], side, tuple(window), minimum, appear_days)
     if st.session_state.get("rank_signature") != signature:
         st.session_state.update(rank_signature=signature, rank_page=0)
     page = st.session_state["rank_page"]
@@ -444,13 +458,14 @@ def ranking_cards(d, window):
             "buy" if side == "買超" else "sell",
             minimum,
             page,
+            appear_days,
         )
     with measure(st.session_state, "render"):
         st.write(
             f"第 {page + 1} 頁・{page * 20 + 1 if total else 0}–{min((page + 1) * 20, total)}／{total} 檔"
         )
         for row in rows:
-            render_stock_card(d, row)
+            render_stock_card(d, row, ranking=True)
         if not rows:
             st.info("無符合資料")
         with st.container(horizontal=True):
@@ -472,7 +487,7 @@ def ranking_page():
         st.subheader(f"{label}{title}前3")
         rows = flat_rank_rows(d["history"], window, direction)[:3]
         for row in rows:
-            render_stock_card(d, row)
+            render_stock_card(d, row, ranking=True)
         if not rows:
             st.info("此區間無資料")
     full = st.expander("完整排行", key="full_ranking", on_change="rerun")
