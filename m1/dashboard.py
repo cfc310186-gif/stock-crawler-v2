@@ -200,51 +200,57 @@ def ranking_chips():
     return side, minimum, appear_days
 
 
-def amount_chart_data(history, code, window):
-    amounts = {
-        r["trade_date"]: number(r.get("net_amount_ntd"))
+def lots_chart_data(history, code, window):
+    lots = {
+        r["trade_date"]: number(r.get("net_lots"))
         for r in history
         if r["code"] == code and r["trade_date"] in window
     }
+    dates = sorted(window)
     frame = pd.DataFrame(
-        [
-            {
-                "日期": date,
-                "每日淨金額": float(amounts[date] / 1000)
-                if amounts.get(date) is not None
-                else None,
-            }
-            for date in sorted(window)
-        ],
-        columns=["日期", "每日淨金額"],
+        {
+            "日期": dates,
+            "每日淨張數": pd.Series(
+                [float(lots[date]) if lots.get(date) is not None else None for date in dates],
+                dtype="float64",
+            ),
+        }
     )
-    frame["累積淨金額"] = frame["每日淨金額"].cumsum()
+    frame["累積淨張數"] = frame["每日淨張數"].cumsum(skipna=True)
     return frame
 
 
-def render_amount_chart(history, code, window):
+def render_lots_chart(history, code, window):
     if not any(r["code"] == code and r["trade_date"] in window for r in history):
         st.info("此區間無資料")
         return
-    frame = amount_chart_data(history, code, window)
+    frame = lots_chart_data(history, code, window)
+    if frame["每日淨張數"].isna().all():
+        st.info("此區間無可用張數資料")
+        return
     base = alt.Chart(frame).encode(
-        x=alt.X("日期:O", title="交易日", axis=alt.Axis(labelAngle=-45))
+        x=alt.X(
+            "日期:O",
+            title="交易日",
+            axis=alt.Axis(labelAngle=-45),
+            scale=alt.Scale(domain=sorted(window)),
+        )
     )
     bars = base.mark_bar().encode(
-        y=alt.Y("每日淨金額:Q", title="淨金額（千元）"),
+        y=alt.Y("每日淨張數:Q", title="淨張數（張）"),
         color=alt.condition(
-            alt.datum["每日淨金額"] >= 0, alt.value("#E67F75"), alt.value("#6CB097")
+            alt.datum["每日淨張數"] >= 0, alt.value("#E67F75"), alt.value("#6CB097")
         ),
-        tooltip=["日期:O", "每日淨金額:Q", "累積淨金額:Q"],
+        tooltip=["日期:O", "每日淨張數:Q", "累積淨張數:Q"],
     )
-    line = base.mark_line(point=True, color="#537CAD").encode(y="累積淨金額:Q")
+    line = base.mark_line(point=True, color="#537CAD").encode(y="累積淨張數:Q")
     st.altair_chart(
         (bars + line).properties(height=300),
         width="stretch",
-        alt=f"{code} 每日淨金額長條與累積淨金額折線，單位千元",
+        alt=f"{code} 每日淨張數長條與累積淨張數折線，單位張",
     )
     st.caption(
-        "金額為實際淨金額；實際張數僅自 2026-11-11 起提供，且限 Top-50 張數榜代號。缺少個股資料的交易日留空，不補零。"
+        "圖為實際淨張數；實際張數僅自 2026-11-11 起提供，且限 Top-50 張數榜代號。缺張數的交易日留空，不補零。累積僅加總區間內有值日期。"
     )
 
 
@@ -399,13 +405,14 @@ def today_page():
         st.warning("最近執行失敗；目前顯示最後已發布資料")
     with measure(st.session_state, "compute"):
         dynamics = outbox.watchlist_dynamics(
-            d["history"], d["date"], {w["code"] for w in d["watch"]}
+            d["history"], d["date"], {w["code"] for w in d["watch"]}, window_days=1
         )
     with measure(st.session_state, "render"):
         st.subheader("Watchlist 動態")
-        st.caption("金額與累積張數為近3日；單日張數為所選交易日。缺值欄位省略。")
+        st.caption("金額與張數為所選交易日當日。缺值欄位省略。")
         for row in dynamics:
-            render_stock_card(d, row)
+            # This page explicitly uses a one-day window; preserve the source summary.
+            render_stock_card(d, dict(row, cum_net_lots=None))
         if not dynamics:
             st.write("自選股當日無可取得資料")
         signals = [e for e in d["events"] if e["rule_id"] in {"R1", "R2", "R3"}]
@@ -591,7 +598,7 @@ def stock_page():
             )
             if edit(d["db"], code, d["names"].get(code, ""), category):
                 st.rerun()
-        render_amount_chart(d["history"], code, window)
+        render_lots_chart(d["history"], code, window)
         st.subheader("訊號原因")
         for event in d["events"]:
             if event["code"] == code and event["rule_id"] in {"R1", "R2", "R3"}:

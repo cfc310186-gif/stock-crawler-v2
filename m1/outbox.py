@@ -96,15 +96,23 @@ def _line(
     return "｜".join(fields)
 
 
-def watchlist_dynamics(history, date, watchlist):
-    """Summarize current-day members over the latest three trading dates."""
+def watchlist_dynamics(history, date, watchlist, *, window_days=3):
+    """Summarize current-day members over the latest window_days trading dates.
+
+    n_days_present counts dates with a nonmissing amount, not history rows.
+    n_days_with_lots counts dates with nonmissing lots; n_days_missing_lots
+    counts dates with a history row but missing lots. Zero amounts and lots
+    are valid values in all counts.
+    """
+    if type(window_days) is not int or window_days <= 0:
+        raise ValueError("window_days must be a positive integer")
     seen = set()
     for r in history:
         identity = (r["trade_date"], r["code"])
         if identity in seen:
             raise ValueError(f"duplicate history row: {identity}")
         seen.add(identity)
-    window = sorted({r["trade_date"] for r in history if r["trade_date"] <= date})[-3:]
+    window = sorted({r["trade_date"] for r in history if r["trade_date"] <= date})[-window_days:]
     members = {
         r["code"] for r in history if r["trade_date"] == date and r["code"] in watchlist
     }
